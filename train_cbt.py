@@ -59,44 +59,66 @@ class CBTTrainer(Trainer):
 
 # --- 3. Main Training Setup ---
 if __name__ == "__main__":
+    from transformers import BitsAndBytesConfig
+    from peft import get_peft_model, LoraConfig
+
     # --- Model and Tokenizer ---
     model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # Set a padding token if it doesn't exist
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print("Loading custom model...")
-    # This now loads from your local modeling_llama.py file
+    # --- QLoRA Configuration ---
+    # This loads the model in 4-bit precision
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
+    )
+
+    print("Loading custom 4-bit model...")
+    # This time, we use both quantization_config and device_map
     model = LlamaForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16,
+        quantization_config=quantization_config,
         device_map="auto",
     )
 
+    # --- PEFT (LoRA) Configuration ---
+    # This freezes the base model and adds small, trainable adapter layers
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=32,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
     # --- Dataset ---
     print("Loading and preparing dataset...")
-    # Using a small, standard dataset for this example
     dataset = load_dataset("Abirate/english_quotes", split="train") 
     
     def tokenize_function(examples):
         return tokenizer(examples["quote"], truncation=True, padding="max_length", max_length=128)
 
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
-    # It's crucial that the dataset has a 'labels' column for the Trainer
     tokenized_dataset = tokenized_dataset.rename_column("input_ids", "labels")
 
     # --- Training ---
     training_args = TrainingArguments(
         output_dir="./cbt_results",
-        num_train_epochs=1, # Set to a low number for initial testing
-        per_device_train_batch_size=1, # Use a small batch size to fit in memory
+        num_train_epochs=1,
+        per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
+        gradient_checkpointing=True,  # Saves more memory
         save_steps=500,
         logging_steps=50,
-        learning_rate=2e-5,
-        fp16=False, # Set to True if you have a GPU that supports it
+        learning_rate=2e-4, # Higher learning rate is common for LoRA
+        fp16=False,
     )
 
     trainer = CBTTrainer(
@@ -104,9 +126,9 @@ if __name__ == "__main__":
         args=training_args,
         train_dataset=tokenized_dataset,
         tokenizer=tokenizer,
-        disentangle_lambda=0.1 # This is the hyperparameter for your custom loss
+        disentangle_lambda=0.1
     )
 
-    print("Starting training...")
+    print("Starting QLoRA training...")
     trainer.train()
     print("Training complete.")
