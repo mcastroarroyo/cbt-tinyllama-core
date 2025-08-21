@@ -302,8 +302,8 @@ class LlamaModel(LlamaPreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        output_attentions: Optional[bool] = None,        # ADD THIS
-        output_hidden_states: Optional[bool] = None,    # ADD THIS
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -312,18 +312,46 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        
-        # ... (code for input checks and embedding remains the same) ...
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
 
-        # ADDED: Initialize containers for hidden states and attentions
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position: torch.Tensor = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        
+        # Initialize containers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-
+        
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            # CORRECTED: Pass the flags and handle the new outputs
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -338,21 +366,23 @@ class LlamaModel(LlamaPreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
+            if use_cache:
+                past_key_values = layer_outputs[1]
+
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-        
+                all_self_attns += (layer_outputs[2 if use_cache else 1],)
+                
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
+            
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-
 
 @auto_docstring
 class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
@@ -404,7 +434,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             cache_position=cache_position,
             **kwargs,
         )
-        
+
         hidden_states = outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -422,12 +452,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             loss = loss_fct(shift_logits, shift_labels)
             
         return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+    loss=loss,
+    logits=logits,
+    past_key_values=outputs.past_key_values,
+    hidden_states=outputs.hidden_states,
+    attentions=outputs.attentions, # This is often None by default
+)
 
 
 class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel): ...
